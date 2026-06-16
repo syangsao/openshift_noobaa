@@ -6,39 +6,31 @@ Handles two known issues:
   1. Version mismatch between noobaa-core StatefulSet and backing store agents
   2. CNPG PostgreSQL replica stuck in pg_rewind loop (no common ancestor)
 
+Configuration is loaded from (highest priority first):
+  1. CLI flags (--ssh, --ssh-user, --ssh-key, --kubeconfig, --namespace)
+  2. Environment variables (SSH_HOST, SSH_USER, SSH_KEY, KUBECONFIG, NAMESPACE)
+  3. .env file next to the script or in the current working directory
+  4. Defaults (see .env.example)
+
 Usage:
-  # Run all checks and fixes:
-  python3 noobaa_fix.py
-
-  # SSH through jump host (default):
-  python3 noobaa_fix.py --ssh grogu.syangsao.lab --ssh-user syangsao --ssh-key ~/.ssh/id_grogu
-
-  # Direct cluster access (kubeconfig already set):
-  python3 noobaa_fix.py --direct
-
-  # Dry run (show what would be done):
-  python3 noobaa_fix.py --dry-run
-
-  # Fix only a specific issue:
+  python3 noobaa_fix.py                  # With .env file
+  python3 noobaa_fix.py --direct         # Direct cluster access
+  python3 noobaa_fix.py --dry-run        # Show what would be done
+  python3 noobaa_fix.py --check-only     # Diagnose without fixing
   python3 noobaa_fix.py --fix version-mismatch
   python3 noobaa_fix.py --fix pg-replica
-
-Environment:
-  KUBECONFIG  — path to kubeconfig (default: ~/ocp421-luke/auth/kubeconfig on grogu)
 """
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
-NAMESPACE = "openshift-storage"
-SSH_KEY_DEFAULT = "~/.ssh/id_grogu"
-SSH_USER_DEFAULT = "syangsao"
-KUBECONFIG_DEFAULT = "~/ocp421-luke/auth/kubeconfig"
+NAMESPACE_DEFAULT = "openshift-storage"
 
 COLORS = {
     "RED": "\033[91m",
@@ -92,24 +84,93 @@ def run_cmd(cmd: list[str], check: bool = True, capture: bool = True) -> subproc
         return subprocess.run(cmd, check=check, timeout=60)
 
 
-def run_oc(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
+# ── .env Loading ─────────────────────────────────────────────────────────────
+
+def load_env(env_path: str) -> dict:
+    """Load key=value pairs from a .env file."""
+    env = {}
+    path = Path(env_path)
+    if not path.exists():
+        return env
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" in line:
+            key, _, value = line.partition("=")
+            value = value.strip().strip("\"'")
+            env[key.strip()] = value
+    return env
+
+
+def resolve_config(args: argparse.Namespace) -> tuple[dict, Path | None]:
+    """Resolve configuration from .env file, env vars, and CLI flags.
+
+    Priority (highest to lowest):
+      1. CLI flags
+      2. OS environment variables
+      3. .env file
+      4. Defaults
+    """
+    # Find .env file (next to script, or in cwd, or --env-file)
+    script_dir = Path(__file__).resolve().parent
+    env_file = None
+    candidates = []
+    if args.env_file:
+        candidates.append(Path(args.env_file))
+    candidates.extend([script_dir / ".env", Path.cwd() / ".env"])
+    for candidate in candidates:
+        if candidate.exists():
+            env_file = candidate
+            break
+
+    env_values = load_env(str(env_file)) if env_file else {}
+
+    def resolve(cli_val, env_key, default=""):
+        """Resolve a config value with priority: CLI > env var > .env > default."""
+        if cli_val is not None and cli_val != "":
+            return cli_val
+        if env_key in os.environ:
+            return os.environ[env_key]
+        if env_key in env_values:
+            return env_values[env_key]
+        return default
+
+    config = {
+        "SSH_HOST": resolve(args.ssh, "SSH_HOST", ""),
+        "SSH_USER": resolve(args.ssh_user, "SSH_USER", ""),
+        "SSH_KEY": resolve(args.ssh_key, "SSH_KEY", ""),
+        "KUBECONFIG": resolve(args.kubeconfig, "KUBECONFIG", ""),
+        "NAMESPACE": resolve(args.namespace, "NAMESPACE", NAMESPACE_DEFAULT),
+    }
+
+    return config, env_file
+
+
+# ── oc Command Execution ─────────────────────────────────────────────────────
+
+def run_oc(args: list[str], namespace: str, kubeconfig: str, check: bool = True) -> subprocess.CompletedProcess:
     """Run an `oc` command, respecting KUBECONFIG."""
     env = None
-    kubeconfig = Path(KUBECONFIG_DEFAULT).expanduser()
-    if kubeconfig.exists():
-        import os
-        env = {**os.environ, "KUBECONFIG": str(kubeconfig)}
-    cmd = ["oc", "-n", NAMESPACE] + args
-    return run_cmd(cmd, check=check)
+    if kubeconfig:
+        kc_path = Path(kubeconfig).expanduser()
+        if kc_path.exists():
+            env = {**os.environ, "KUBECONFIG": str(kc_path)}
+    cmd = ["oc", "-n", namespace] + args
+    return run_cmd(cmd, check=check, capture=True)
 
 
-def run_oc_remote(ssh_host: str, ssh_user: str, ssh_key: str, oc_args: list[str], check: bool = True) -> subprocess.CompletedProcess:
+def run_oc_remote(
+    ssh_host: str, ssh_user: str, ssh_key: str,
+    oc_args: list[str], namespace: str, kubeconfig: str,
+    check: bool = True,
+) -> subprocess.CompletedProcess:
     """Run an `oc` command via SSH through a jump host."""
-    kubeconfig = Path(KUBECONFIG_DEFAULT).expanduser()
+    kc_path = Path(kubeconfig).expanduser() if kubeconfig else ""
     oc_args_str = " ".join(oc_args)
     full_cmd = (
         f"ssh -i {ssh_key} {ssh_user}@{ssh_host} "
-        f"'KUBECONFIG={kubeconfig} oc -n {NAMESPACE} {oc_args_str}'"
+        f"'KUBECONFIG={kc_path} oc -n {namespace} {oc_args_str}'"
     )
     return subprocess.run(
         full_cmd,
@@ -121,29 +182,26 @@ def run_oc_remote(ssh_host: str, ssh_user: str, ssh_key: str, oc_args: list[str]
     )
 
 
-def oc(args: list[str], mode: str, ssh_host: str, ssh_user: str, ssh_key: str, check: bool = True) -> subprocess.CompletedProcess:
+def oc(
+    args: list[str],
+    mode: str,
+    ssh_host: str, ssh_user: str, ssh_key: str,
+    namespace: str, kubeconfig: str,
+    check: bool = True,
+) -> subprocess.CompletedProcess:
     """Dispatch oc command based on connection mode."""
     if mode == "direct":
-        return run_oc(args, check)
+        return run_oc(args, namespace, kubeconfig, check)
     else:
-        return run_oc_remote(ssh_host, ssh_user, ssh_key, args, check)
-
-
-def oc_get_json(args: list[str], mode: str, ssh_host: str, ssh_user: str, ssh_key: str) -> dict:
-    """Run oc get ... -o json and parse the result."""
-    result = oc(args + ["-o", "json"], mode, ssh_host, ssh_user, ssh_key)
-    return json.loads(result.stdout)
-
-
-def oc_get_field(args: list[str], mode: str, ssh_host: str, ssh_user: str, ssh_key: str) -> str:
-    """Run oc get ... with jsonpath and return the string value."""
-    result = oc(args + ["-o", "jsonpath='{.spec.template.spec.containers[0].image}'"], mode, ssh_host, ssh_user, ssh_key)
-    return result.stdout.strip().strip("'")
+        return run_oc_remote(ssh_host, ssh_user, ssh_key, args, namespace, kubeconfig, check)
 
 
 # ── Issue 1: Version Mismatch ────────────────────────────────────────────────
 
-def diagnose_version_mismatch(mode: str, ssh_host: str, ssh_user: str, ssh_key: str) -> dict:
+def diagnose_version_mismatch(
+    mode: str, ssh_host: str, ssh_user: str, ssh_key: str,
+    namespace: str, kubeconfig: str,
+) -> dict:
     """Check if noobaa-core image version mismatches backing store agent images."""
     section("DIAGNOSIS: Backing Store Agent Version Mismatch")
 
@@ -152,7 +210,7 @@ def diagnose_version_mismatch(mode: str, ssh_host: str, ssh_user: str, ssh_key: 
     try:
         core_result = oc(
             ["get", "sts/noobaa-core", "-o", "jsonpath='{.spec.template.spec.containers[0].image}'"],
-            mode, ssh_host, ssh_user, ssh_key,
+            mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfig,
         )
         core_image = core_result.stdout.strip().strip("'")
         info(f"  noobaa-core image: {core_image}")
@@ -160,57 +218,38 @@ def diagnose_version_mismatch(mode: str, ssh_host: str, ssh_user: str, ssh_key: 
         error(f"  Failed to get noobaa-core image: {e.stderr.strip()}")
         return {"fixable": False, "reason": "Cannot read noobaa-core image"}
 
-    # Get backing store agent image (first one found)
+    # Get backing store agent image (try multiple approaches)
     info("Checking backing store agent images...")
+    agent_image = ""
+
+    # Try label selector
     try:
         agents_result = oc(
-            ["get", "pods", "-l", " backingstore-name=noobaa-default-backing-store",
+            ["get", "pods", "-l", "backingstore-name=noobaa-default-backing-store",
              "-o", "jsonpath='{.items[0].spec.containers[0].image}'"],
-            mode, ssh_host, ssh_user, ssh_key,
+            mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfig,
             check=False,
         )
         agent_image = agents_result.stdout.strip().strip("'") if agents_result.returncode == 0 else ""
     except Exception:
         agent_image = ""
 
-    # Also try by pod name pattern
-    if not agent_image or agent_image == "":
-        info("  Trying alternative agent pod query...")
-        try:
-            agents_result = oc(
-                ["get", "pods", "--no-headers", "-o", "custom-columns=NAME:.metadata.name,IMAGE:.spec.containers[0].image",
-                 "-l", " backingstore-name=noobaa-default-backing-store"],
-                mode, ssh_host, ssh_user, ssh_key,
-                check=False,
-            )
-            if agents_result.returncode == 0 and agents_result.stdout.strip():
-                lines = agents_result.stdout.strip().split("\n")
-                for line in lines:
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        agent_image = parts[-1]
-                        break
-        except Exception:
-            pass
-
     # Fallback: get all pods and find agent pods
-    if not agent_image or agent_image == "":
+    if not agent_image:
         info("  Falling back to listing all NooBaa-related pods...")
         try:
             pods_result = oc(
                 ["get", "pods", "--no-headers"],
-                mode, ssh_host, ssh_user, ssh_key,
+                mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfig,
             )
-            agent_image = ""
             for line in pods_result.stdout.strip().split("\n"):
                 if "noobaa-pod-" in line:
                     parts = line.split()
                     if len(parts) >= 5:
                         pod_name = parts[0]
-                        # Get image from specific pod
                         pod_result = oc(
                             ["get", "pod", pod_name, "-o", "jsonpath='{.spec.containers[0].image}'"],
-                            mode, ssh_host, ssh_user, ssh_key,
+                            mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfig,
                             check=False,
                         )
                         if pod_result.returncode == 0:
@@ -235,12 +274,12 @@ def diagnose_version_mismatch(mode: str, ssh_host: str, ssh_user: str, ssh_key: 
 
     # Check for CrashLoopBackOff pods
     info("Checking for CrashLoopBackOff pods...")
+    crash_pods = []
     try:
         crash_pods_result = oc(
             ["get", "pods", "--no-headers", "-o", "custom-columns=NAME:.metadata.name,STATUS:.status.phase"],
-            mode, ssh_host, ssh_user, ssh_key,
+            mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfig,
         )
-        crash_pods = []
         for line in crash_pods_result.stdout.strip().split("\n"):
             parts = line.split()
             if len(parts) >= 2 and "CrashLoopBackOff" in parts[-1]:
@@ -278,20 +317,19 @@ def diagnose_version_mismatch(mode: str, ssh_host: str, ssh_user: str, ssh_key: 
         }
 
 
-def fix_version_mismatch(diag: dict, dry_run: bool, mode: str, ssh_host: str, ssh_user: str, ssh_key: str):
+def fix_version_mismatch(
+    diag: dict, dry_run: bool,
+    mode: str, ssh_host: str, ssh_user: str, ssh_key: str,
+    namespace: str, kubeconfig: str,
+):
     """Fix version mismatch by aligning noobaa-core image with agent image."""
     section("FIX: Align noobaa-core image with backing store agents")
 
     agent_image = diag["agent_image"]
     info(f"Target image: {agent_image}")
 
-    cmd_desc = (
-        f"oc set image sts/noobaa-core -n {NAMESPACE} "
-        f"core={agent_image} noobaa-log-processor={agent_image}"
-    )
-
     if dry_run:
-        info(f"[DRY-RUN] Would run: {cmd_desc}")
+        info(f"[DRY-RUN] Would run: oc set image sts/noobaa-core -n {namespace} core={agent_image} noobaa-log-processor={agent_image}")
         return True
 
     # Execute the fix
@@ -303,7 +341,7 @@ def fix_version_mismatch(diag: dict, dry_run: bool, mode: str, ssh_host: str, ss
                 f"core={agent_image}",
                 f"noobaa-log-processor={agent_image}",
             ],
-            mode, ssh_host, ssh_user, ssh_key,
+            mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfig,
         )
         success("Image update applied:")
         print(f"  {result.stdout.strip()}")
@@ -318,7 +356,7 @@ def fix_version_mismatch(diag: dict, dry_run: bool, mode: str, ssh_host: str, ss
     try:
         verify_result = oc(
             ["get", "sts/noobaa-core", "-o", "jsonpath='{.spec.template.spec.containers[0].image}'"],
-            mode, ssh_host, ssh_user, ssh_key,
+            mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfig,
         )
         new_image = verify_result.stdout.strip().strip("'")
         new_version = new_image.split("/")[-1].split("@")[0] if "/" in new_image else new_image.split("@")[0]
@@ -330,13 +368,16 @@ def fix_version_mismatch(diag: dict, dry_run: bool, mode: str, ssh_host: str, ss
         warn(f"Could not verify: {e}")
 
     info("Backing store agents should reconnect and stop crashing within 1-2 minutes.")
-    info("Verify with: oc get pods -n openshift-storage | grep CrashLoopBackOff")
+    info(f"Verify with: oc get pods -n {namespace} | grep CrashLoopBackOff")
     return True
 
 
 # ── Issue 2: CNPG PostgreSQL Replica Stuck ───────────────────────────────────
 
-def diagnose_pg_replica(mode: str, ssh_host: str, ssh_user: str, ssh_key: str) -> dict:
+def diagnose_pg_replica(
+    mode: str, ssh_host: str, ssh_user: str, ssh_key: str,
+    namespace: str, kubeconfig: str,
+) -> dict:
     """Check if CNPG PostgreSQL replica is stuck in pg_rewind loop."""
     section("DIAGNOSIS: CNPG PostgreSQL Replica Status")
 
@@ -348,7 +389,7 @@ def diagnose_pg_replica(mode: str, ssh_host: str, ssh_user: str, ssh_key: str) -
                 "get", "clusters.postgresql.cnpg.noobaa.io", "noobaa-db-pg-cluster",
                 "-o", "jsonpath='{.status.instances},{.status.readyInstances},{.status.phase}'"
             ],
-            mode, ssh_host, ssh_user, ssh_key,
+            mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfig,
             check=False,
         )
         if cluster_result.returncode == 0:
@@ -358,7 +399,6 @@ def diagnose_pg_replica(mode: str, ssh_host: str, ssh_user: str, ssh_key: str) -
             if len(parts) >= 3:
                 instances = int(parts[0]) if parts[0].isdigit() else 0
                 ready = int(parts[1]) if parts[1].isdigit() else 0
-                phase = parts[2]
                 if ready < instances:
                     warn(f"  Only {ready}/{instances} instances ready")
                 else:
@@ -370,12 +410,12 @@ def diagnose_pg_replica(mode: str, ssh_host: str, ssh_user: str, ssh_key: str) -
 
     # Check db-pg pods
     info("Checking db-pg pod status...")
+    stuck_replica = None
     try:
         pods_result = oc(
             ["get", "pods", "-l", "cluster-name=noobaa-db-pg-cluster", "--no-headers"],
-            mode, ssh_host, ssh_user, ssh_key,
+            mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfig,
         )
-        stuck_replica = None
         for line in pods_result.stdout.strip().split("\n"):
             parts = line.split()
             if len(parts) >= 3:
@@ -399,7 +439,7 @@ def diagnose_pg_replica(mode: str, ssh_host: str, ssh_user: str, ssh_key: str) -
         try:
             logs_result = oc(
                 ["logs", stuck_replica, "--tail=100"],
-                mode, ssh_host, ssh_user, ssh_key,
+                mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfig,
                 check=False,
             )
             if logs_result.returncode == 0:
@@ -427,7 +467,6 @@ def diagnose_pg_replica(mode: str, ssh_host: str, ssh_user: str, ssh_key: str) -
                     }
                 else:
                     warn("  Could not identify specific pg_rewind issue from logs")
-                    # Show last few log lines for manual inspection
                     last_lines = [l for l in log_text.strip().split("\n")[-10:] if l.strip()]
                     if last_lines:
                         info("  Last 10 log lines:")
@@ -446,7 +485,11 @@ def diagnose_pg_replica(mode: str, ssh_host: str, ssh_user: str, ssh_key: str) -
     return {"fixable": False, "reason": "No stuck replicas"}
 
 
-def fix_pg_replica(diag: dict, dry_run: bool, mode: str, ssh_host: str, ssh_user: str, ssh_key: str):
+def fix_pg_replica(
+    diag: dict, dry_run: bool,
+    mode: str, ssh_host: str, ssh_user: str, ssh_key: str,
+    namespace: str, kubeconfig: str,
+):
     """Fix stuck CNPG replica by performing manual pg_basebackup."""
     replica = diag["stuck_replica"]
     section(f"FIX: Resync {replica} via pg_basebackup")
@@ -499,7 +542,7 @@ def fix_pg_replica(diag: dict, dry_run: bool, mode: str, ssh_host: str, ssh_user
     for i, step in enumerate(steps, 1):
         info(f"Step {i}/{len(steps)}: {step['name']}")
         try:
-            result = oc(step["cmd"], mode, ssh_host, ssh_user, ssh_key, check=False)
+            result = oc(step["cmd"], mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfig, check=False)
             if result.returncode == 0:
                 success(f"  Completed: {step['name']}")
                 if result.stdout.strip():
@@ -510,7 +553,6 @@ def fix_pg_replica(diag: dict, dry_run: bool, mode: str, ssh_host: str, ssh_user
                     print(f"  Error: {result.stderr.strip()[:300]}")
                 return False
         except subprocess.TimeoutExpired:
-            # pg_basebackup may take a while — allow it
             if i == 3:
                 success(f"  Completed (with timeout): {step['name']}")
             else:
@@ -524,14 +566,17 @@ def fix_pg_replica(diag: dict, dry_run: bool, mode: str, ssh_host: str, ssh_user
     info("CNPG will restart the pod with fresh pgdata.")
     info("The instance may be promoted as new primary — this is normal.")
     info("Verify with:")
-    info(f"  oc get pods -n {NAMESPACE} | grep db-pg")
-    info(f"  oc get clusters.postgresql.cnpg.noobaa.io noobaa-db-pg-cluster -n {NAMESPACE}")
+    info(f"  oc get pods -n {namespace} | grep db-pg")
+    info(f"  oc get clusters.postgresql.cnpg.noobaa.io noobaa-db-pg-cluster -n {namespace}")
     return True
 
 
 # ── Overall Status Check ─────────────────────────────────────────────────────
 
-def check_overall_status(mode: str, ssh_host: str, ssh_user: str, ssh_key: str):
+def check_overall_status(
+    mode: str, ssh_host: str, ssh_user: str, ssh_key: str,
+    namespace: str, kubeconfig: str,
+):
     """Quick overview of NooBaa health."""
     section("NOOBAA OVERALL STATUS")
 
@@ -540,7 +585,7 @@ def check_overall_status(mode: str, ssh_host: str, ssh_user: str, ssh_key: str):
     try:
         result = oc(
             ["get", "pods", "--no-headers"],
-            mode, ssh_host, ssh_user, ssh_key,
+            mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfig,
         )
         status_counts = {}
         for line in result.stdout.strip().split("\n"):
@@ -564,7 +609,7 @@ def check_overall_status(mode: str, ssh_host: str, ssh_user: str, ssh_key: str):
     try:
         result = oc(
             ["get", "noobaa", "noobaa", "-o", "jsonpath='{.status.phase}'"],
-            mode, ssh_host, ssh_user, ssh_key,
+            mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfig,
             check=False,
         )
         if result.returncode == 0:
@@ -588,22 +633,27 @@ def main():
     parser.add_argument(
         "--direct",
         action="store_true",
-        help="Connect directly (use local oc + KUBECONFIG env var)",
+        help="Connect directly (use local oc + KUBECONFIG)",
     )
     parser.add_argument(
         "--ssh",
         default=None,
-        help="SSH jump host (default: grogu.syangsao.lab)",
+        help="SSH jump host (overrides .env / SSH_HOST env var)",
     )
     parser.add_argument(
         "--ssh-user",
-        default=SSH_USER_DEFAULT,
-        help=f"SSH user (default: {SSH_USER_DEFAULT})",
+        default=None,
+        help="SSH user (overrides .env / SSH_USER env var)",
     )
     parser.add_argument(
         "--ssh-key",
-        default=SSH_KEY_DEFAULT,
-        help=f"SSH key path (default: {SSH_KEY_DEFAULT})",
+        default=None,
+        help="SSH key path (overrides .env / SSH_KEY env var)",
+    )
+    parser.add_argument(
+        "--kubeconfig",
+        default=None,
+        help="Path to kubeconfig (overrides .env / KUBECONFIG env var)",
     )
     parser.add_argument(
         "--dry-run",
@@ -622,24 +672,38 @@ def main():
         help="Only diagnose, don't apply fixes",
     )
     parser.add_argument(
+        "--env-file",
+        default=None,
+        help="Path to .env file (default: .env next to script or in cwd)",
+    )
+    parser.add_argument(
         "--namespace",
-        default=NAMESPACE,
-        help=f"OpenShift namespace (default: {NAMESPACE})",
+        default=None,
+        help="OpenShift namespace (overrides .env / NAMESPACE env var)",
     )
 
     args = parser.parse_args()
 
+    # Resolve config from .env, env vars, CLI flags
+    config, env_file = resolve_config(args)
+
+    if env_file:
+        info(f"Loaded config from: {env_file}")
+
     # Determine connection mode
     if args.direct:
         mode = "direct"
-        ssh_host = ssh_user = ssh_key = ""
     else:
         mode = "ssh"
-        ssh_host = args.ssh or "grogu.syangsao.lab"
-        ssh_user = args.ssh_user
-        ssh_key = args.ssh_key
+        if not config["SSH_HOST"]:
+            error("SSH_HOST is required. Set it in .env, SSH_HOST env var, or --ssh flag.")
+            sys.exit(1)
 
-    ns = args.namespace
+    ssh_host = config["SSH_HOST"] if mode == "ssh" else ""
+    ssh_user = config["SSH_USER"] if mode == "ssh" else ""
+    ssh_key = config["SSH_KEY"] if mode == "ssh" else ""
+    ns = config["NAMESPACE"]
+    kubeconfig = config["KUBECONFIG"]
 
     print(color("\n╔══════════════════════════════════════════════════════════════╗", "BOLD"))
     print(color("║         NooBaa CrashLoopBackOff Diagnostic & Fix Tool       ║", "BOLD"))
@@ -651,23 +715,23 @@ def main():
         info("[CHECK-ONLY MODE — diagnostics only, no fixes]")
 
     # Overall status
-    check_overall_status(mode, ssh_host, ssh_user, ssh_key)
+    check_overall_status(mode, ssh_host, ssh_user, ssh_key, ns, kubeconfig)
 
     results = {}
 
     # Issue 1: Version mismatch
     if args.fix in ("version-mismatch", "all"):
-        diag = diagnose_version_mismatch(mode, ssh_host, ssh_user, ssh_key)
+        diag = diagnose_version_mismatch(mode, ssh_host, ssh_user, ssh_key, ns, kubeconfig)
         results["version_mismatch"] = diag
         if diag.get("fixable") and not args.check_only:
-            fix_version_mismatch(diag, args.dry_run, mode, ssh_host, ssh_user, ssh_key)
+            fix_version_mismatch(diag, args.dry_run, mode, ssh_host, ssh_user, ssh_key, ns, kubeconfig)
 
     # Issue 2: PG replica
     if args.fix in ("pg-replica", "all"):
-        diag = diagnose_pg_replica(mode, ssh_host, ssh_user, ssh_key)
+        diag = diagnose_pg_replica(mode, ssh_host, ssh_user, ssh_key, ns, kubeconfig)
         results["pg_replica"] = diag
         if diag.get("fixable") and not args.check_only:
-            fix_pg_replica(diag, args.dry_run, mode, ssh_host, ssh_user, ssh_key)
+            fix_pg_replica(diag, args.dry_run, mode, ssh_host, ssh_user, ssh_key, ns, kubeconfig)
 
     # Summary
     section("SUMMARY")

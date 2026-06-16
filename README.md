@@ -4,6 +4,77 @@ Diagnostic and repair tool for NooBaa CrashLoopBackOff issues on OpenShift Data 
 
 This script automates the troubleshooting and repair of two recurring NooBaa failures that require manual `oc` commands to resolve. Rather than memorizing the exact sequence of commands or digging through logs each time, run this tool to diagnose the issue and optionally apply the fix.
 
+## Quick Start
+
+```bash
+# Clone the repo:
+git clone https://github.com/syangsao/openshift_noobaa.git
+cd openshift_noobaa
+
+# Copy and configure .env:
+cp .env.example .env
+# Edit .env with your SSH host, user, key, and kubeconfig path
+
+# Diagnose everything (no changes):
+python3 noobaa_fix.py --check-only
+
+# See what would be done without making changes:
+python3 noobaa_fix.py --dry-run
+
+# Diagnose and fix automatically:
+python3 noobaa_fix.py
+```
+
+## Configuration
+
+The script loads configuration from three sources in priority order (highest first):
+
+1. **CLI flags** — `--ssh`, `--ssh-user`, `--ssh-key`, `--kubeconfig`, `--namespace`
+2. **Environment variables** — `SSH_HOST`, `SSH_USER`, `SSH_KEY`, `KUBECONFIG`, `NAMESPACE`
+3. **`.env` file** — placed next to the script or in the current working directory
+
+Copy `.env.example` to `.env` and fill in your values:
+
+```ini
+# SSH Jump Host (required for SSH mode)
+SSH_HOST=your-jump-host.example.com
+SSH_USER=your-username
+SSH_KEY=~/.ssh/your-key
+
+# OpenShift
+KUBECONFIG=~/path/to/kubeconfig
+NAMESPACE=openshift-storage
+```
+
+### Connection Modes
+
+**SSH through jump host (default):**
+```bash
+python3 noobaa_fix.py
+# Reads SSH_HOST, SSH_USER, SSH_KEY, KUBECONFIG from .env
+```
+
+**Direct access (oc already configured locally):**
+```bash
+python3 noobaa_fix.py --direct
+# Uses KUBECONFIG from .env, env var, or system
+```
+
+### Command-Line Options
+
+| Flag | Description |
+|------|-------------|
+| `--direct` | Connect directly using local `oc` + `KUBECONFIG` |
+| `--ssh HOST` | SSH jump host (overrides .env / env var) |
+| `--ssh-user USER` | SSH username (overrides .env / env var) |
+| `--ssh-key PATH` | SSH private key path (overrides .env / env var) |
+| `--kubeconfig PATH` | Path to kubeconfig (overrides .env / env var) |
+| `--namespace NS` | OpenShift namespace (overrides .env / env var) |
+| `--env-file PATH` | Custom .env file path |
+| `--dry-run` | Show what would be done without making changes |
+| `--check-only` | Run diagnostics only, skip fixes |
+| `--fix ISSUE` | Fix specific issue: `version-mismatch`, `pg-replica`, or `all` (default: `all`) |
+
 ## Problem
 
 On OpenShift clusters running ODF with a standalone MCG (Multi-Cloud Gateway) configuration, NooBaa can enter degraded states that the ODF operator does not automatically recover from. The following two issues have been observed and resolved:
@@ -53,68 +124,6 @@ The ODF operator and CNPG are designed for common failure scenarios (pod evictio
 - CNPG **does not fall back to `pg_basebackup`** when `pg_rewind` fails with "no common ancestor" in this version — it keeps retrying `pg_rewind` indefinitely
 
 Both require manual intervention. This script codifies that intervention so it can be run consistently without referencing notes or documentation.
-
-## Usage
-
-```bash
-# Clone or download:
-git clone https://github.com/syangsao/openshift_noobaa.git
-cd openshift_noobaa
-
-# Diagnose everything (no changes):
-python3 noobaa_fix.py --check-only
-
-# See what would be done without making changes:
-python3 noobaa_fix.py --dry-run
-
-# Diagnose and fix automatically:
-python3 noobaa_fix.py
-
-# Fix only a specific issue:
-python3 noobaa_fix.py --fix version-mismatch
-python3 noobaa_fix.py --fix pg-replica
-```
-
-### Connection Modes
-
-The script supports two ways to reach your OpenShift cluster:
-
-**SSH through jump host (default):**
-```bash
-python3 noobaa_fix.py
-# Uses: grogu.syangsao.lab, user syangsao, key ~/.ssh/id_grogu
-# KUBECONFIG: ~/ocp421-luke/auth/kubeconfig (on grogu)
-```
-
-```bash
-# Custom jump host:
-python3 noobaa_fix.py --ssh your-jump-host --ssh-user your-user --ssh-key ~/.ssh/your-key
-```
-
-**Direct access (oc already configured locally):**
-```bash
-python3 noobaa_fix.py --direct
-# Uses KUBECONFIG from environment or ~/ocp421-luke/auth/kubeconfig
-```
-
-### Command-Line Options
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--direct` | Connect directly using local `oc` + `KUBECONFIG` | SSH mode |
-| `--ssh HOST` | SSH jump host | `grogu.syangsao.lab` |
-| `--ssh-user USER` | SSH username | `syangsao` |
-| `--ssh-key PATH` | SSH private key path | `~/.ssh/id_grogu` |
-| `--dry-run` | Show what would be done without making changes | Off |
-| `--check-only` | Run diagnostics only, skip fixes | Off |
-| `--fix ISSUE` | Fix specific issue: `version-mismatch`, `pg-replica`, or `all` | `all` |
-| `--namespace NS` | OpenShift namespace | `openshift-storage` |
-
-### Environment Variables
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `KUBECONFIG` | Path to kubeconfig | `~/ocp421-luke/auth/kubeconfig` (on grogu) |
 
 ## How It Works
 
